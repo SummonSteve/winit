@@ -10,10 +10,10 @@ use windows_sys::Win32::{
     Globalization::HIMC,
     UI::{
         Input::Ime::{
-            ImmAssociateContextEx, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
+            ImmGetCandidateListW, ImmAssociateContextEx, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
             ImmSetCandidateWindow, ATTR_TARGET_CONVERTED, ATTR_TARGET_NOTCONVERTED, CANDIDATEFORM,
             CFS_EXCLUDE, GCS_COMPATTR, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR, IACE_CHILDREN,
-            IACE_DEFAULT,
+            IACE_DEFAULT, CANDIDATELIST
         },
         WindowsAndMessaging::{GetSystemMetrics, SM_IMMENABLED},
     },
@@ -69,6 +69,30 @@ impl ImeContext {
 
     pub unsafe fn get_composed_text(&self) -> Option<String> {
         self.get_composition_string(GCS_RESULTSTR)
+    }
+
+    pub unsafe fn get_candidate_list(&self) -> Option<Vec<String>> {
+        let size = ImmGetCandidateListW(self.himc, 0, std::ptr::null_mut(), 0) as usize;
+        if size == 0 {
+            return None;
+        }
+        let mut buf: Vec<u8> = Vec::with_capacity(size);
+        let ret = ImmGetCandidateListW(self.himc, 0, buf.as_mut_ptr() as *mut _, size as u32);
+        if ret == 0 {
+            return None;
+        }
+        buf.set_len(size);
+        let obj = &*(buf.as_ptr() as *const CANDIDATELIST);
+        let mut list: Vec<String> = Vec::with_capacity(obj.dwCount as usize);
+        for i in 0..(obj.dwCount as usize) {
+            let offset =
+                std::slice::from_raw_parts(&obj.dwOffset as *const u32, obj.dwCount as usize);
+            let p = buf.as_ptr().offset(offset[i] as isize) as *const u16;
+            let len = (0..isize::MAX).position(|i| *p.offset(i) == 0).unwrap();
+            let slice = std::slice::from_raw_parts(p, len);
+            list.push(String::from_utf16_lossy(slice));
+        }
+        Some(list)
     }
 
     unsafe fn get_composition_cursor(&self, text: &str) -> Option<usize> {

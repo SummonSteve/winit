@@ -805,6 +805,8 @@ pub enum Ime {
     /// like [`Window::set_ime_position`].
     Enabled,
 
+    CandidateUpdate(Vec<String>),
+
     /// Notifies when a new composing text should be set at the cursor position.
     ///
     /// The value represents a pair of the preedit string and the cursor begin position and end

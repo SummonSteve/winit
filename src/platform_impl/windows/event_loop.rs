@@ -69,7 +69,7 @@ use windows_sys::Win32::{
             WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH, WM_WINDOWPOSCHANGED,
             WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED,
             WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_OVERLAPPED, WS_POPUP,
-            WS_VISIBLE,
+            WS_VISIBLE, WM_IME_NOTIFY
         },
     },
 };
@@ -1181,6 +1181,22 @@ unsafe fn public_window_callback_inner<T: 'static>(
                     });
                 }
             }
+            0
+        }
+
+        WM_IME_NOTIFY => {
+            let ime_allowed = userdata.window_state.lock().ime_allowed;
+            if ime_allowed {
+                if wparam == 3 {
+                    let ime_context = ImeContext::current(window);
+                    let list = ime_context.get_candidate_list().unwrap();
+
+                    userdata.send_event(Event::WindowEvent {
+                        window_id: RootWindowId(WindowId(window)),
+                        event: WindowEvent::Ime(Ime::CandidateUpdate(list)),
+                    });
+                }
+            };
             0
         }
 
