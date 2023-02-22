@@ -1,21 +1,18 @@
+#![allow(clippy::unnecessary_cast)]
+
 use std::{collections::VecDeque, fmt};
 
-use super::{ffi, util};
-use crate::{
-    dpi::{PhysicalPosition, PhysicalSize},
-    monitor::{MonitorHandle as RootMonitorHandle, VideoMode as RootVideoMode},
-};
-use cocoa::{
-    appkit::NSScreen,
-    base::{id, nil},
-    foundation::NSUInteger,
-};
 use core_foundation::{
     array::{CFArrayGetCount, CFArrayGetValueAtIndex},
     base::{CFRelease, TCFType},
     string::CFString,
 };
 use core_graphics::display::{CGDirectDisplayID, CGDisplay, CGDisplayBounds};
+use objc2::rc::{Id, Shared};
+
+use super::appkit::NSScreen;
+use super::ffi;
+use crate::dpi::{PhysicalPosition, PhysicalSize};
 
 #[derive(Clone)]
 pub struct VideoMode {
@@ -91,10 +88,8 @@ impl VideoMode {
         self.refresh_rate_millihertz
     }
 
-    pub fn monitor(&self) -> RootMonitorHandle {
-        RootMonitorHandle {
-            inner: self.monitor.clone(),
-        }
+    pub fn monitor(&self) -> MonitorHandle {
+        self.monitor.clone()
     }
 }
 
@@ -187,7 +182,7 @@ impl MonitorHandle {
     pub fn name(&self) -> Option<String> {
         let MonitorHandle(display_id) = *self;
         let screen_num = CGDisplay::new(display_id).model_number();
-        Some(format!("Monitor #{}", screen_num))
+        Some(format!("Monitor #{screen_num}"))
     }
 
     #[inline]
@@ -213,31 +208,33 @@ impl MonitorHandle {
     }
 
     pub fn scale_factor(&self) -> f64 {
-        let screen = match self.ns_screen() {
-            Some(screen) => screen,
-            None => return 1.0, // default to 1.0 when we can't find the screen
-        };
-        unsafe { NSScreen::backingScaleFactor(screen) as f64 }
+        match self.ns_screen() {
+            Some(screen) => screen.backingScaleFactor() as f64,
+            None => 1.0, // default to 1.0 when we can't find the screen
+        }
     }
 
     pub fn refresh_rate_millihertz(&self) -> Option<u32> {
         unsafe {
             let mut display_link = std::ptr::null_mut();
-            assert_eq!(
-                ffi::CVDisplayLinkCreateWithCGDisplay(self.0, &mut display_link),
-                ffi::kCVReturnSuccess
-            );
+            if ffi::CVDisplayLinkCreateWithCGDisplay(self.0, &mut display_link)
+                != ffi::kCVReturnSuccess
+            {
+                return None;
+            }
             let time = ffi::CVDisplayLinkGetNominalOutputVideoRefreshPeriod(display_link);
             ffi::CVDisplayLinkRelease(display_link);
 
             // This value is indefinite if an invalid display link was specified
-            assert!(time.flags & ffi::kCVTimeIsIndefinite == 0);
+            if time.flags & ffi::kCVTimeIsIndefinite != 0 {
+                return None;
+            }
 
             Some((time.time_scale as i64 / time.time_value * 1000) as u32)
         }
     }
 
-    pub fn video_modes(&self) -> impl Iterator<Item = RootVideoMode> {
+    pub fn video_modes(&self) -> impl Iterator<Item = VideoMode> {
         let refresh_rate_millihertz = self.refresh_rate_millihertz().unwrap_or(0);
         let monitor = self.clone();
 
@@ -282,7 +279,7 @@ impl MonitorHandle {
                     unimplemented!()
                 };
 
-                let video_mode = VideoMode {
+                VideoMode {
                     size: (
                         ffi::CGDisplayModeGetPixelWidth(mode) as u32,
                         ffi::CGDisplayModeGetPixelHeight(mode) as u32,
@@ -291,33 +288,24 @@ impl MonitorHandle {
                     bit_depth,
                     monitor: monitor.clone(),
                     native_mode: NativeDisplayMode(mode),
-                };
-
-                RootVideoMode { video_mode }
+                }
             })
         }
     }
 
-    pub(crate) fn ns_screen(&self) -> Option<id> {
-        unsafe {
-            let uuid = ffi::CGDisplayCreateUUIDFromDisplayID(self.0);
-            let screens = NSScreen::screens(nil);
-            let count: NSUInteger = msg_send![screens, count];
-            let key = util::ns_string_id_ref("NSScreenNumber");
-            for i in 0..count {
-                let screen = msg_send![screens, objectAtIndex: i as NSUInteger];
-                let device_description = NSScreen::deviceDescription(screen);
-                let value: id = msg_send![device_description, objectForKey:*key];
-                if value != nil {
-                    let other_native_id: NSUInteger = msg_send![value, unsignedIntegerValue];
-                    let other_uuid =
-                        ffi::CGDisplayCreateUUIDFromDisplayID(other_native_id as CGDirectDisplayID);
-                    if uuid == other_uuid {
-                        return Some(screen);
-                    }
-                }
-            }
-            None
-        }
+    pub(crate) fn ns_screen(&self) -> Option<Id<NSScreen, Shared>> {
+        let uuid = unsafe { ffi::CGDisplayCreateUUIDFromDisplayID(self.0) };
+        NSScreen::screens()
+            .into_iter()
+            .find(|screen| {
+                let other_native_id = screen.display_id();
+                let other_uuid = unsafe {
+                    ffi::CGDisplayCreateUUIDFromDisplayID(other_native_id as CGDirectDisplayID)
+                };
+                uuid == other_uuid
+            })
+            .map(|screen| unsafe {
+                Id::retain(screen as *const NSScreen as *mut NSScreen).unwrap()
+            })
     }
 }

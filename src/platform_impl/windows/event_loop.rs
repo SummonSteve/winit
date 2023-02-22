@@ -10,6 +10,7 @@ use std::{
     mem, panic, ptr,
     rc::Rc,
     sync::{
+        atomic::{AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc, Mutex, MutexGuard,
     },
@@ -35,8 +36,8 @@ use windows_sys::Win32::{
         Input::{
             Ime::{GCS_COMPSTR, GCS_RESULTSTR, ISC_SHOWUICOMPOSITIONWINDOW},
             KeyboardAndMouse::{
-                MapVirtualKeyA, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE,
-                TRACKMOUSEEVENT,
+                MapVirtualKeyA, ReleaseCapture, SetCapture, TrackMouseEvent, MAPVK_VK_TO_VSC,
+                TME_LEAVE, TRACKMOUSEEVENT,
             },
             Pointer::{
                 POINTER_FLAG_DOWN, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO,
@@ -50,10 +51,10 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-            GetMessageW, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
-            PostThreadMessageW, RegisterClassExW, RegisterWindowMessageA, SetCursor, SetWindowPos,
-            TranslateMessage, CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE, GWL_USERDATA,
-            HTCAPTION, HTCLIENT, MAPVK_VK_TO_VSC, MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE,
+            GetMenu, GetMessageW, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW,
+            PostMessageW, PostThreadMessageW, RegisterClassExW, RegisterWindowMessageA, SetCursor,
+            SetWindowPos, TranslateMessage, CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE,
+            GWL_USERDATA, HTCAPTION, HTCLIENT, MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE,
             NCCALCSIZE_PARAMS, PM_NOREMOVE, PM_QS_PAINT, PM_REMOVE, PT_PEN, PT_TOUCH, QS_ALLEVENTS,
             RI_KEY_E0, RI_KEY_E1, RI_MOUSE_WHEEL, SC_MINIMIZE, SC_RESTORE, SIZE_MAXIMIZED,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WHEEL_DELTA, WINDOWPOS,
@@ -65,7 +66,7 @@ use windows_sys::Win32::{
             WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY,
             WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
             WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
-            WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH, WM_WINDOWPOSCHANGED,
+            WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH, WM_WINDOWPOSCHANGED,
             WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED,
             WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_OVERLAPPED, WS_POPUP,
             WS_VISIBLE, WM_IME_NOTIFY
@@ -79,7 +80,6 @@ use crate::{
     event_loop::{
         ControlFlow, DeviceEventFilter, EventLoopClosed, EventLoopWindowTarget as RootELW,
     },
-    monitor::MonitorHandle as RootMonitorHandle,
     platform_impl::platform::{
         dark_mode::try_theme,
         dpi::{become_dpi_aware, dpi_to_scale_factor},
@@ -90,9 +90,9 @@ use crate::{
         raw_input, util,
         window::InitData,
         window_state::{CursorFlags, ImeState, WindowFlags, WindowState},
-        wrap_device_id, WindowId, DEVICE_ID,
+        wrap_device_id, Fullscreen, WindowId, DEVICE_ID,
     },
-    window::{Fullscreen, WindowId as RootWindowId},
+    window::WindowId as RootWindowId,
 };
 use runner::{EventLoopRunner, EventLoopRunnerShared};
 
@@ -205,7 +205,10 @@ impl<T: 'static> EventLoop<T> {
 
         let thread_msg_target = create_event_target_window::<T>();
 
-        thread::spawn(move || wait_thread(thread_id, thread_msg_target));
+        thread::Builder::new()
+            .name("winit wait thread".to_string())
+            .spawn(move || wait_thread(thread_id, thread_msg_target))
+            .expect("Failed to spawn winit wait thread");
         let wait_thread_id = get_wait_thread_id();
 
         let runner_shared = Rc::new(EventLoopRunner::new(thread_msg_target, wait_thread_id));
@@ -322,9 +325,9 @@ impl<T> EventLoopWindowTarget<T> {
         monitor::available_monitors()
     }
 
-    pub fn primary_monitor(&self) -> Option<RootMonitorHandle> {
+    pub fn primary_monitor(&self) -> Option<MonitorHandle> {
         let monitor = monitor::primary_monitor();
-        Some(RootMonitorHandle { inner: monitor })
+        Some(monitor)
     }
 
     pub fn raw_display_handle(&self) -> RawDisplayHandle {
@@ -383,13 +386,13 @@ fn get_wait_thread_id() -> u32 {
         let result = GetMessageW(
             &mut msg,
             -1,
-            *SEND_WAIT_THREAD_ID_MSG_ID,
-            *SEND_WAIT_THREAD_ID_MSG_ID,
+            SEND_WAIT_THREAD_ID_MSG_ID.get(),
+            SEND_WAIT_THREAD_ID_MSG_ID.get(),
         );
         assert_eq!(
-            msg.message, *SEND_WAIT_THREAD_ID_MSG_ID,
-            "this shouldn't be possible. please open an issue with Winit. error code: {}",
-            result
+            msg.message,
+            SEND_WAIT_THREAD_ID_MSG_ID.get(),
+            "this shouldn't be possible. please open an issue with Winit. error code: {result}"
         );
         msg.lParam as u32
     }
@@ -414,7 +417,7 @@ fn wait_thread(parent_thread_id: u32, msg_window_id: HWND) {
         let cur_thread_id = GetCurrentThreadId();
         PostThreadMessageW(
             parent_thread_id,
-            *SEND_WAIT_THREAD_ID_MSG_ID,
+            SEND_WAIT_THREAD_ID_MSG_ID.get(),
             0,
             cur_thread_id as LPARAM,
         );
@@ -438,9 +441,9 @@ fn wait_thread(parent_thread_id: u32, msg_window_id: HWND) {
                 DispatchMessageW(&msg);
             }
 
-            if msg.message == *WAIT_UNTIL_MSG_ID {
+            if msg.message == WAIT_UNTIL_MSG_ID.get() {
                 wait_until_opt = Some(*WaitUntilInstantBox::from_raw(msg.lParam as *mut _));
-            } else if msg.message == *CANCEL_WAIT_UNTIL_MSG_ID {
+            } else if msg.message == CANCEL_WAIT_UNTIL_MSG_ID.get() {
                 wait_until_opt = None;
             }
 
@@ -468,11 +471,11 @@ fn wait_thread(parent_thread_id: u32, msg_window_id: HWND) {
                         timeEndPeriod(period);
                     }
                     if resume_reason == WAIT_TIMEOUT {
-                        PostMessageW(msg_window_id, *PROCESS_NEW_EVENTS_MSG_ID, 0, 0);
+                        PostMessageW(msg_window_id, PROCESS_NEW_EVENTS_MSG_ID.get(), 0, 0);
                         wait_until_opt = None;
                     }
                 } else {
-                    PostMessageW(msg_window_id, *PROCESS_NEW_EVENTS_MSG_ID, 0, 0);
+                    PostMessageW(msg_window_id, PROCESS_NEW_EVENTS_MSG_ID.get(), 0, 0);
                     wait_until_opt = None;
                 }
             }
@@ -493,11 +496,11 @@ fn dur2timeout(dur: Duration) -> u32 {
         .checked_mul(1000)
         .and_then(|ms| ms.checked_add((dur.subsec_nanos() as u64) / 1_000_000))
         .and_then(|ms| {
-            ms.checked_add(if dur.subsec_nanos() % 1_000_000 > 0 {
-                1
+            if dur.subsec_nanos() % 1_000_000 > 0 {
+                ms.checked_add(1)
             } else {
-                0
-            })
+                Some(ms)
+            }
         })
         .map(|ms| {
             if ms > u32::MAX as u64 {
@@ -558,7 +561,7 @@ impl EventLoopThreadExecutor {
 
                 let raw = Box::into_raw(boxed2);
 
-                let res = PostMessageW(self.target_window, *EXEC_MSG_ID, raw as usize, 0);
+                let res = PostMessageW(self.target_window, EXEC_MSG_ID.get(), raw as usize, 0);
                 assert!(
                     res != false.into(),
                     "PostMessage failed; is the messages queue full?"
@@ -588,7 +591,7 @@ impl<T: 'static> Clone for EventLoopProxy<T> {
 impl<T: 'static> EventLoopProxy<T> {
     pub fn send_event(&self, event: T) -> Result<(), EventLoopClosed<T>> {
         unsafe {
-            if PostMessageW(self.target_window, *USER_EVENT_MSG_ID, 0, 0) != false.into() {
+            if PostMessageW(self.target_window, USER_EVENT_MSG_ID.get(), 0, 0) != false.into() {
                 self.event_send.send(event).ok();
                 Ok(())
             } else {
@@ -600,40 +603,84 @@ impl<T: 'static> EventLoopProxy<T> {
 
 type WaitUntilInstantBox = Box<Instant>;
 
+/// A lazily-initialized window message ID.
+pub struct LazyMessageId {
+    /// The ID.
+    id: AtomicU32,
+
+    /// The name of the message.
+    name: &'static str,
+}
+
+/// An invalid custom window ID.
+const INVALID_ID: u32 = 0x0;
+
+impl LazyMessageId {
+    /// Create a new `LazyId`.
+    const fn new(name: &'static str) -> Self {
+        Self {
+            id: AtomicU32::new(INVALID_ID),
+            name,
+        }
+    }
+
+    /// Get the message ID.
+    pub fn get(&self) -> u32 {
+        // Load the ID.
+        let id = self.id.load(Ordering::Relaxed);
+
+        if id != INVALID_ID {
+            return id;
+        }
+
+        // Register the message.
+        // SAFETY: We are sure that the pointer is a valid C string ending with '\0'.
+        assert!(self.name.ends_with('\0'));
+        let new_id = unsafe { RegisterWindowMessageA(self.name.as_ptr()) };
+
+        assert_ne!(
+            new_id,
+            0,
+            "RegisterWindowMessageA returned zero for '{}': {}",
+            self.name,
+            std::io::Error::last_os_error()
+        );
+
+        // Store the new ID. Since `RegisterWindowMessageA` returns the same value for any given string,
+        // the target value will always either be a). `INVALID_ID` or b). the correct ID. Therefore a
+        // compare-and-swap operation here (or really any consideration) is never necessary.
+        self.id.store(new_id, Ordering::Relaxed);
+
+        new_id
+    }
+}
+
 // Message sent by the `EventLoopProxy` when we want to wake up the thread.
 // WPARAM and LPARAM are unused.
-static USER_EVENT_MSG_ID: Lazy<u32> =
-    Lazy::new(|| unsafe { RegisterWindowMessageA("Winit::WakeupMsg\0".as_ptr()) });
+static USER_EVENT_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::WakeupMsg\0");
 // Message sent when we want to execute a closure in the thread.
 // WPARAM contains a Box<Box<dyn FnMut()>> that must be retrieved with `Box::from_raw`,
 // and LPARAM is unused.
-static EXEC_MSG_ID: Lazy<u32> =
-    Lazy::new(|| unsafe { RegisterWindowMessageA("Winit::ExecMsg\0".as_ptr()) });
-static PROCESS_NEW_EVENTS_MSG_ID: Lazy<u32> =
-    Lazy::new(|| unsafe { RegisterWindowMessageA("Winit::ProcessNewEvents\0".as_ptr()) });
+static EXEC_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::ExecMsg\0");
+static PROCESS_NEW_EVENTS_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::ProcessNewEvents\0");
 /// lparam is the wait thread's message id.
-static SEND_WAIT_THREAD_ID_MSG_ID: Lazy<u32> =
-    Lazy::new(|| unsafe { RegisterWindowMessageA("Winit::SendWaitThreadId\0".as_ptr()) });
+static SEND_WAIT_THREAD_ID_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::SendWaitThreadId\0");
 /// lparam points to a `Box<Instant>` signifying the time `PROCESS_NEW_EVENTS_MSG_ID` should
 /// be sent.
-static WAIT_UNTIL_MSG_ID: Lazy<u32> =
-    Lazy::new(|| unsafe { RegisterWindowMessageA("Winit::WaitUntil\0".as_ptr()) });
-static CANCEL_WAIT_UNTIL_MSG_ID: Lazy<u32> =
-    Lazy::new(|| unsafe { RegisterWindowMessageA("Winit::CancelWaitUntil\0".as_ptr()) });
+static WAIT_UNTIL_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::WaitUntil\0");
+static CANCEL_WAIT_UNTIL_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::CancelWaitUntil\0");
 // Message sent by a `Window` when it wants to be destroyed by the main thread.
 // WPARAM and LPARAM are unused.
-pub static DESTROY_MSG_ID: Lazy<u32> =
-    Lazy::new(|| unsafe { RegisterWindowMessageA("Winit::DestroyMsg\0".as_ptr()) });
+pub static DESTROY_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::DestroyMsg\0");
 // WPARAM is a bool specifying the `WindowFlags::MARKER_RETAIN_STATE_ON_SIZE` flag. See the
 // documentation in the `window_state` module for more information.
-pub static SET_RETAIN_STATE_ON_SIZE_MSG_ID: Lazy<u32> =
-    Lazy::new(|| unsafe { RegisterWindowMessageA("Winit::SetRetainMaximized\0".as_ptr()) });
+pub static SET_RETAIN_STATE_ON_SIZE_MSG_ID: LazyMessageId =
+    LazyMessageId::new("Winit::SetRetainMaximized\0");
 static THREAD_EVENT_TARGET_WINDOW_CLASS: Lazy<Vec<u16>> =
     Lazy::new(|| util::encode_wide("Winit Thread Event Target"));
 /// When the taskbar is created, it registers a message with the "TaskbarCreated" string and then broadcasts this message to all top-level windows
 /// <https://docs.microsoft.com/en-us/windows/win32/shell/taskbar#taskbar-creation-notification>
-pub static TASKBAR_CREATED: Lazy<u32> =
-    Lazy::new(|| unsafe { RegisterWindowMessageA("TaskbarCreated\0".as_ptr()) });
+pub static TASKBAR_CREATED: LazyMessageId = LazyMessageId::new("TaskbarCreated\0");
 
 fn create_event_target_window<T: 'static>() -> HWND {
     use windows_sys::Win32::UI::WindowsAndMessaging::CS_HREDRAW;
@@ -785,13 +832,18 @@ unsafe fn flush_paint_messages<T: 'static>(
 unsafe fn process_control_flow<T: 'static>(runner: &EventLoopRunner<T>) {
     match runner.control_flow() {
         ControlFlow::Poll => {
-            PostMessageW(runner.thread_msg_target(), *PROCESS_NEW_EVENTS_MSG_ID, 0, 0);
+            PostMessageW(
+                runner.thread_msg_target(),
+                PROCESS_NEW_EVENTS_MSG_ID.get(),
+                0,
+                0,
+            );
         }
         ControlFlow::Wait => (),
         ControlFlow::WaitUntil(until) => {
             PostThreadMessageW(
                 runner.wait_thread_id(),
-                *WAIT_UNTIL_MSG_ID,
+                WAIT_UNTIL_MSG_ID.get(),
                 0,
                 Box::into_raw(WaitUntilInstantBox::new(until)) as isize,
             );
@@ -979,19 +1031,31 @@ unsafe fn public_window_callback_inner<T: 'static>(
                 return DefWindowProcW(window, msg, wparam, lparam);
             }
 
-            // Extend the client area to cover the whole non-client area.
-            // https://docs.microsoft.com/en-us/windows/win32/winmsg/wm-nccalcsize#remarks
-            //
-            // HACK(msiglreith): To add the drop shadow we slightly tweak the non-client area.
-            // This leads to a small black 1px border on the top. Adding a margin manually
-            // on all 4 borders would result in the caption getting drawn by the DWM.
-            //
-            // Another option would be to allow the DWM to paint inside the client area.
-            // Unfortunately this results in janky resize behavior, where the compositor is
-            // ahead of the window surface. Currently, there seems no option to achieve this
-            // with the Windows API.
-            if window_flags.contains(WindowFlags::MARKER_UNDECORATED_SHADOW) {
-                let params = &mut *(lparam as *mut NCCALCSIZE_PARAMS);
+            let params = &mut *(lparam as *mut NCCALCSIZE_PARAMS);
+
+            if util::is_maximized(window) {
+                // Limit the window size when maximized to the current monitor.
+                // Otherwise it would include the non-existent decorations.
+                //
+                // Use `MonitorFromRect` instead of `MonitorFromWindow` to select
+                // the correct monitor here.
+                // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/2549
+                let monitor = MonitorFromRect(&params.rgrc[0], MONITOR_DEFAULTTONULL);
+                if let Ok(monitor_info) = monitor::get_monitor_info(monitor) {
+                    params.rgrc[0] = monitor_info.monitorInfo.rcWork;
+                }
+            } else if window_flags.contains(WindowFlags::MARKER_UNDECORATED_SHADOW) {
+                // Extend the client area to cover the whole non-client area.
+                // https://docs.microsoft.com/en-us/windows/win32/winmsg/wm-nccalcsize#remarks
+                //
+                // HACK(msiglreith): To add the drop shadow we slightly tweak the non-client area.
+                // This leads to a small black 1px border on the top. Adding a margin manually
+                // on all 4 borders would result in the caption getting drawn by the DWM.
+                //
+                // Another option would be to allow the DWM to paint inside the client area.
+                // Unfortunately this results in janky resize behavior, where the compositor is
+                // ahead of the window surface. Currently, there seems no option to achieve this
+                // with the Windows API.
                 params.rgrc[0].top += 1;
                 params.rgrc[0].bottom += 1;
             }
@@ -1007,9 +1071,13 @@ unsafe fn public_window_callback_inner<T: 'static>(
         }
 
         WM_EXITSIZEMOVE => {
-            userdata
-                .window_state_lock()
-                .set_window_flags_in_place(|f| f.remove(WindowFlags::MARKER_IN_SIZE_MOVE));
+            let mut state = userdata.window_state_lock();
+            if state.dragging {
+                state.dragging = false;
+                PostMessageW(window, WM_LBUTTONUP, 0, lparam);
+            }
+
+            state.set_window_flags_in_place(|f| f.remove(WindowFlags::MARKER_IN_SIZE_MOVE));
             0
         }
 
@@ -1111,7 +1179,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
                             if new_monitor != 0
                                 && fullscreen_monitor
                                     .as_ref()
-                                    .map(|monitor| new_monitor != monitor.inner.hmonitor())
+                                    .map(|monitor| new_monitor != monitor.hmonitor())
                                     .unwrap_or(true)
                             {
                                 if let Ok(new_monitor_info) = monitor::get_monitor_info(new_monitor)
@@ -1122,13 +1190,11 @@ unsafe fn public_window_callback_inner<T: 'static>(
                                     window_pos.cx = new_monitor_rect.right - new_monitor_rect.left;
                                     window_pos.cy = new_monitor_rect.bottom - new_monitor_rect.top;
                                 }
-                                *fullscreen_monitor = Some(crate::monitor::MonitorHandle {
-                                    inner: MonitorHandle::new(new_monitor),
-                                });
+                                *fullscreen_monitor = Some(MonitorHandle::new(new_monitor));
                             }
                         }
                         Fullscreen::Exclusive(ref video_mode) => {
-                            let old_monitor = video_mode.video_mode.monitor.hmonitor();
+                            let old_monitor = video_mode.monitor.hmonitor();
                             if let Ok(old_monitor_info) = monitor::get_monitor_info(old_monitor) {
                                 let old_monitor_rect = old_monitor_info.monitorInfo.rcMonitor;
                                 window_pos.x = old_monitor_rect.left;
@@ -1150,8 +1216,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
 
             let windowpos = lparam as *const WINDOWPOS;
             if (*windowpos).flags & SWP_NOMOVE != SWP_NOMOVE {
-                let physical_position =
-                    PhysicalPosition::new((*windowpos).x as i32, (*windowpos).y as i32);
+                let physical_position = PhysicalPosition::new((*windowpos).x, (*windowpos).y);
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
                     event: Moved(physical_position),
@@ -1184,12 +1249,11 @@ unsafe fn public_window_callback_inner<T: 'static>(
                     w.set_window_flags_in_place(|f| f.set(WindowFlags::MAXIMIZED, maximized));
                 }
             }
-
             userdata.send_event(event);
             0
         }
 
-        WM_CHAR => {
+        WM_CHAR | WM_SYSCHAR => {
             use crate::event::WindowEvent::ReceivedCharacter;
             use std::char;
             let is_high_surrogate = (0xD800..=0xDBFF).contains(&wparam);
@@ -1220,7 +1284,18 @@ unsafe fn public_window_callback_inner<T: 'static>(
                 }
             }
 
-            0
+            // todo(msiglreith):
+            //   Ideally, `WM_SYSCHAR` shouldn't emit a `ReceivedChar` event
+            //   indicating user text input. As we lack dedicated support
+            //   accelerators/keybindings these events will be additionally
+            //   emitted for downstream users.
+            //   This means certain key combinations (ie Alt + Space) will
+            //   trigger the default system behavior **and** emit a char event.
+            if msg == WM_SYSCHAR {
+                DefWindowProcW(window, msg, wparam, lparam)
+            } else {
+                0
+            }
         }
 
         WM_IME_NOTIFY => {
@@ -1280,6 +1355,10 @@ unsafe fn public_window_callback_inner<T: 'static>(
 
                         userdata.send_event(Event::WindowEvent {
                             window_id: RootWindowId(WindowId(window)),
+                            event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                        });
+                        userdata.send_event(Event::WindowEvent {
+                            window_id: RootWindowId(WindowId(window)),
                             event: WindowEvent::Ime(Ime::Commit(text)),
                         });
                     }
@@ -1314,6 +1393,10 @@ unsafe fn public_window_callback_inner<T: 'static>(
                     // trying receiving composing result and commit if exists.
                     let ime_context = ImeContext::current(window);
                     if let Some(text) = ime_context.get_composed_text() {
+                        userdata.send_event(Event::WindowEvent {
+                            window_id: RootWindowId(WindowId(window)),
+                            event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                        });
                         userdata.send_event(Event::WindowEvent {
                             window_id: RootWindowId(WindowId(window)),
                             event: WindowEvent::Ime(Ime::Commit(text)),
@@ -1537,13 +1620,19 @@ unsafe fn public_window_callback_inner<T: 'static>(
                     },
                 });
             }
-            0
+            if msg == WM_SYSKEYUP && GetMenu(window) != 0 {
+                // let Windows handle event if the window has a native menu, a modal event loop
+                // is started here on Alt key up.
+                DefWindowProcW(window, msg, wparam, lparam)
+            } else {
+                0
+            }
         }
 
         WM_LBUTTONDOWN => {
             use crate::event::{ElementState::Pressed, MouseButton::Left, WindowEvent::MouseInput};
 
-            capture_mouse(window, &mut *userdata.window_state_lock());
+            capture_mouse(window, &mut userdata.window_state_lock());
 
             update_modifiers(window, userdata);
 
@@ -1585,7 +1674,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
                 ElementState::Pressed, MouseButton::Right, WindowEvent::MouseInput,
             };
 
-            capture_mouse(window, &mut *userdata.window_state_lock());
+            capture_mouse(window, &mut userdata.window_state_lock());
 
             update_modifiers(window, userdata);
 
@@ -1627,7 +1716,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
                 ElementState::Pressed, MouseButton::Middle, WindowEvent::MouseInput,
             };
 
-            capture_mouse(window, &mut *userdata.window_state_lock());
+            capture_mouse(window, &mut userdata.window_state_lock());
 
             update_modifiers(window, userdata);
 
@@ -1670,7 +1759,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
             };
             let xbutton = super::get_xbutton_wparam(wparam as u32);
 
-            capture_mouse(window, &mut *userdata.window_state_lock());
+            capture_mouse(window, &mut userdata.window_state_lock());
 
             update_modifiers(window, userdata);
 
@@ -1909,7 +1998,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
         }
 
         WM_NCACTIVATE => {
-            let is_active = wparam == 1;
+            let is_active = wparam != false.into();
             let active_focus_changed = userdata.window_state_lock().set_active(is_active);
             if active_focus_changed {
                 if is_active {
@@ -2151,6 +2240,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
                     // The direction to nudge the window in to get the window onto the monitor with
                     // the new DPI factor. We calculate this by seeing which monitor edges are
                     // shared and nudging away from the wrong monitor based on those.
+                    #[allow(clippy::bool_to_int_with_if)]
                     let delta_nudge_to_dpi_monitor = (
                         if wrong_monitor_rect.left == new_monitor_rect.right {
                             -1
@@ -2206,7 +2296,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
 
             let preferred_theme = userdata.window_state_lock().preferred_theme;
 
-            if preferred_theme == None {
+            if preferred_theme.is_none() {
                 let new_theme = try_theme(window, preferred_theme);
                 let mut window_state = userdata.window_state_lock();
 
@@ -2224,16 +2314,16 @@ unsafe fn public_window_callback_inner<T: 'static>(
         }
 
         _ => {
-            if msg == *DESTROY_MSG_ID {
+            if msg == DESTROY_MSG_ID.get() {
                 DestroyWindow(window);
                 0
-            } else if msg == *SET_RETAIN_STATE_ON_SIZE_MSG_ID {
+            } else if msg == SET_RETAIN_STATE_ON_SIZE_MSG_ID.get() {
                 let mut window_state = userdata.window_state_lock();
                 window_state.set_window_flags_in_place(|f| {
                     f.set(WindowFlags::MARKER_RETAIN_STATE_ON_SIZE, wparam != 0)
                 });
                 0
-            } else if msg == *TASKBAR_CREATED {
+            } else if msg == TASKBAR_CREATED.get() {
                 let window_state = userdata.window_state_lock();
                 set_skip_taskbar(window, window_state.skip_taskbar);
                 DefWindowProcW(window, msg, wparam, lparam)
@@ -2422,21 +2512,21 @@ unsafe extern "system" fn thread_event_target_callback<T: 'static>(
             DefWindowProcW(window, msg, wparam, lparam)
         }
 
-        _ if msg == *USER_EVENT_MSG_ID => {
+        _ if msg == USER_EVENT_MSG_ID.get() => {
             if let Ok(event) = userdata.user_event_receiver.recv() {
                 userdata.send_event(Event::UserEvent(event));
             }
             0
         }
-        _ if msg == *EXEC_MSG_ID => {
-            let mut function: ThreadExecFn = Box::from_raw(wparam as usize as *mut _);
+        _ if msg == EXEC_MSG_ID.get() => {
+            let mut function: ThreadExecFn = Box::from_raw(wparam as *mut _);
             function();
             0
         }
-        _ if msg == *PROCESS_NEW_EVENTS_MSG_ID => {
+        _ if msg == PROCESS_NEW_EVENTS_MSG_ID.get() => {
             PostThreadMessageW(
                 userdata.event_loop_runner.wait_thread_id(),
-                *CANCEL_WAIT_UNTIL_MSG_ID,
+                CANCEL_WAIT_UNTIL_MSG_ID.get(),
                 0,
                 0,
             );

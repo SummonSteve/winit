@@ -9,7 +9,7 @@ use crate::event::{Ime, WindowEvent};
 use crate::platform_impl::wayland;
 use crate::platform_impl::wayland::event_loop::WinitState;
 
-use super::{Preedit, TextInputHandler, TextInputInner};
+use super::{Preedit, TextInputHandler, TextInputInner, ZwpTextInputV3Ext};
 
 #[inline]
 pub(super) fn handle_text_input(
@@ -32,6 +32,7 @@ pub(super) fn handle_text_input(
             // Enable text input on that surface.
             if window_handle.ime_allowed.get() {
                 text_input.enable();
+                text_input.set_content_type_by_purpose(window_handle.ime_purpose.get());
                 text_input.commit();
                 event_sink.push_window_event(WindowEvent::Ime(Ime::Enabled), window_id);
             }
@@ -68,9 +69,14 @@ pub(super) fn handle_text_input(
             cursor_begin,
             cursor_end,
         } => {
-            let cursor_begin = usize::try_from(cursor_begin).ok();
-            let cursor_end = usize::try_from(cursor_end).ok();
             let text = text.unwrap_or_default();
+            let cursor_begin = usize::try_from(cursor_begin)
+                .ok()
+                .and_then(|idx| text.is_char_boundary(idx).then(|| idx));
+            let cursor_end = usize::try_from(cursor_end)
+                .ok()
+                .and_then(|idx| text.is_char_boundary(idx).then(|| idx));
+
             inner.pending_preedit = Some(Preedit {
                 text,
                 cursor_begin,
@@ -88,18 +94,27 @@ pub(super) fn handle_text_input(
                 _ => return,
             };
 
+            // Clear preedit at the start of `Done`.
+            event_sink.push_window_event(
+                WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                window_id,
+            );
+
+            // Send `Commit`.
             if let Some(text) = inner.pending_commit.take() {
                 event_sink.push_window_event(WindowEvent::Ime(Ime::Commit(text)), window_id);
             }
 
-            // Push preedit string we've got after latest commit.
+            // Send preedit.
             if let Some(preedit) = inner.pending_preedit.take() {
                 let cursor_range = preedit
                     .cursor_begin
                     .map(|b| (b, preedit.cursor_end.unwrap_or(b)));
 
-                let event = Ime::Preedit(preedit.text, cursor_range);
-                event_sink.push_window_event(WindowEvent::Ime(event), window_id);
+                event_sink.push_window_event(
+                    WindowEvent::Ime(Ime::Preedit(preedit.text, cursor_range)),
+                    window_id,
+                );
             }
         }
         _ => (),

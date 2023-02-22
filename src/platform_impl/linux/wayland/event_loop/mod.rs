@@ -19,6 +19,7 @@ use sctk::environment::Environment;
 use sctk::seat::pointer::{ThemeManager, ThemeSpec};
 use sctk::WaylandSource;
 
+use crate::dpi::{LogicalSize, PhysicalSize};
 use crate::event::{Event, StartCause, WindowEvent};
 use crate::event_loop::{ControlFlow, EventLoopWindowTarget as RootEventLoopWindowTarget};
 use crate::platform_impl::platform::sticky_exit_callback;
@@ -268,7 +269,7 @@ impl<T: 'static> EventLoop<T> {
                     PlatformEventLoopWindowTarget::Wayland(window_target) => {
                         window_target.state.get_mut()
                     }
-                    #[cfg(feature = "x11")]
+                    #[cfg(x11_platform)]
                     _ => unreachable!(),
                 };
 
@@ -374,17 +375,18 @@ impl<T: 'static> EventLoop<T> {
             });
 
             for (window_id, window_compositor_update) in window_compositor_updates.iter_mut() {
-                if let Some(scale_factor) = window_compositor_update.scale_factor.map(|f| f as f64)
-                {
+                if let Some(scale_factor) = window_compositor_update.scale_factor {
                     let mut physical_size = self.with_state(|state| {
                         let window_handle = state.window_map.get(window_id).unwrap();
+                        *window_handle.scale_factor.lock().unwrap() = scale_factor;
+
                         let mut size = window_handle.size.lock().unwrap();
 
                         // Update the new logical size if it was changed.
                         let window_size = window_compositor_update.size.unwrap_or(*size);
                         *size = window_size;
 
-                        window_size.to_physical(scale_factor)
+                        logical_to_physical_rounded(window_size, scale_factor)
                     });
 
                     sticky_exit_callback(
@@ -409,6 +411,15 @@ impl<T: 'static> EventLoop<T> {
                 if let Some(size) = window_compositor_update.size.take() {
                     let physical_size = self.with_state(|state| {
                         let window_handle = state.window_map.get_mut(window_id).unwrap();
+
+                        if let Some(fs_state) = window_handle.fractional_scaling_state.as_ref() {
+                            // If we have a viewport then we support fractional scaling. As per the
+                            // protocol, we have to set the viewport size of the size prior scaling.
+                            fs_state
+                                .viewport
+                                .set_destination(size.width as _, size.height as _);
+                        }
+
                         let mut window_size = window_handle.size.lock().unwrap();
 
                         // Always issue resize event on scale factor change.
@@ -419,9 +430,8 @@ impl<T: 'static> EventLoop<T> {
                             None
                         } else {
                             *window_size = size;
-                            let scale_factor =
-                                sctk::get_surface_scale_factor(window_handle.window.surface());
-                            let physical_size = size.to_physical(scale_factor as f64);
+                            let scale_factor = window_handle.scale_factor();
+                            let physical_size = logical_to_physical_rounded(size, scale_factor);
                             Some(physical_size)
                         };
 
@@ -431,12 +441,22 @@ impl<T: 'static> EventLoop<T> {
                         window_handle.window.resize(size.width, size.height);
                         window_handle.window.refresh();
 
+                        // Update the opaque region.
+                        window_handle.set_transparent(window_handle.transparent.get());
+
                         // Mark that refresh isn't required, since we've done it right now.
                         state
                             .window_user_requests
                             .get_mut(window_id)
                             .unwrap()
                             .refresh_frame = false;
+
+                        // Queue redraw requested.
+                        state
+                            .window_user_requests
+                            .get_mut(window_id)
+                            .unwrap()
+                            .redraw_requested = true;
 
                         physical_size
                     });
@@ -561,7 +581,7 @@ impl<T: 'static> EventLoop<T> {
     fn with_state<U, F: FnOnce(&mut WinitState) -> U>(&mut self, f: F) -> U {
         let state = match &mut self.window_target.p {
             PlatformEventLoopWindowTarget::Wayland(window_target) => window_target.state.get_mut(),
-            #[cfg(feature = "x11")]
+            #[cfg(x11_platform)]
             _ => unreachable!(),
         };
 
@@ -571,7 +591,7 @@ impl<T: 'static> EventLoop<T> {
     fn loop_dispatch<D: Into<Option<std::time::Duration>>>(&mut self, timeout: D) -> IOResult<()> {
         let state = match &mut self.window_target.p {
             PlatformEventLoopWindowTarget::Wayland(window_target) => window_target.state.get_mut(),
-            #[cfg(feature = "x11")]
+            #[cfg(x11_platform)]
             _ => unreachable!(),
         };
 
@@ -579,4 +599,11 @@ impl<T: 'static> EventLoop<T> {
             .dispatch(timeout, state)
             .map_err(|error| error.into())
     }
+}
+
+// The default routine does floor, but we need round on Wayland.
+fn logical_to_physical_rounded(size: LogicalSize<u32>, scale_factor: f64) -> PhysicalSize<u32> {
+    let width = size.width as f64 * scale_factor;
+    let height = size.height as f64 * scale_factor;
+    (width.round(), height.round()).into()
 }
